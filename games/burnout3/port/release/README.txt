@@ -166,7 +166,10 @@ long gone) has four pages and the game's hidden menu (Triangle goes back):
              pictures between drawn between them - the cars, the camera,
              the garage's car; the menus' flat pictures and movies move at
              60; where the PC cannot keep up, a race steps down to 120 or
-             60 by itself; never above your screen's refresh), the
+             60 by itself; never above your screen's refresh; on a
+             screen 120 does not divide - 144 or 165 Hz, VRR off - 120
+             is the screen's own rate, as DISPLAY, since 120 pictures on
+             a 144 Hz screen cannot be shown evenly), the
              internal resolution
              (original, twice as sharp, or as sharp as your screen - up to
              4x), the aspect ratio (4:3, 16:9 or your window's), and

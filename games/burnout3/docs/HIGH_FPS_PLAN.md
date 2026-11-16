@@ -156,6 +156,45 @@ in the menus, and what moves placed between.
 the crash's flying parts (where they live, apart from the movies');
 then the mechanism into the engine for every game.
 
+## Step 6: even pacing, lost blanks, a cheaper take-down (2026-11-16, #26)
+
+#26: at 120 "the game stutters" - at first a stutter at a fixed interval,
+after a later release smooth at first, then "very laggy", the FPS counter
+at 120 all the while; at 60 fine. Three causes found in the engine
+(engine/host/src/high_fps.cpp, refresh_lock.h), none measured on the
+reporter's PC (no log or screen given):
+
+- **A rate the screen cannot show evenly.** FRAME RATE 120 paced the
+  blanks at twice the game's 59.94 (SetFastForward(2): 119.88 a second)
+  whatever the screen. On a 120 Hz screen without the refresh lock (no
+  measured refresh, VRR set on a fixed screen, or the lock given up) that
+  gained a picture every 8.3 s - one shown twice, a stutter at a steady
+  beat; on a 144 or 165 Hz screen (borderless keeps the desktop's rate) one
+  picture in five shown for two refreshes. Now, on a fixed-refresh screen
+  (VRR off, its refresh known), FRAME RATE is one of the screen's whole
+  fractions (refresh_lock::EvenRate: 120 on 120 or 240 Hz; the screen's own
+  on 144 or 165 Hz) and the blanks run at exactly that, the screen's as it
+  reports it, not 2 x 59.94; the game's steps stay 59.94 a second and the
+  placing between steps takes up the difference (as DISPLAY always did at
+  144). The step down where the PC does not keep up goes to the screen's
+  next fraction where there is one (240 -> 120 on a 240 Hz screen).
+  Scripted runs (virtual time) and VRR screens are as before.
+- **Lost blanks were lost time.** The timer keeps three blanks waiting for
+  a game that is behind and drops the rest (LostVblanks); at 120 three are
+  25 ms, half of 60's. The steps a picture runs were counted from the
+  blanks the game took, so each lost blank was a step's time lost: the race
+  in slow motion, the pictures still presented at 120. Now the lost blanks
+  count as the picture's time (at most 8 a frame; the steps are bounded by
+  the game's own most as before), and they count with late pictures in the
+  step down (more than 5% in two seconds).
+- **The take-down's allocations.** The transforms after each step were two
+  hash maps (and a third for the steps' measures): ~850 allocations and
+  frees a step each. Now sorted vectors, walked side by side; the same
+  pictures (a synthetic game of 300 moving transforms, a camera and
+  teleports: the placed RAM's hash identical after each of 2400 pictures,
+  old and new), the high frame rate's own time a picture about 25% less
+  (850 transforms in 2 MB: ~75 us to ~55 us).
+
 ## For every game (the engine) - done 2026-10-20
 
 The mechanism is the engine's now: engine/host/include/ps2host/high_fps.h
