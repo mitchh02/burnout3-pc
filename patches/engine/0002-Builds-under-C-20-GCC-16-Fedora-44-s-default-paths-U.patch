@@ -1,0 +1,160 @@
+From 5711856765b2153141e7f9a00901aabcb909d9cc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 13:28:12 -0600
+Subject: [PATCH 2/2] Builds under C++20 (GCC 16, Fedora 44's default): paths'
+ UTF-8 names through ps2host::Utf8
+
+path::u8string() is a std::string in C++17 and a std::u8string (char8_t)
+in C++20; mc2.cpp, mcserv.cpp, gpu_bridge.cpp and the host tests took it as
+a std::string and did not compile where C++20 is the default. Utf8()
+(ps2host/utf8_path.h) gives a std::string under either. Checked: the host
+and its tests built and passed with -std=c++17 and -std=c++20 (GCC 13).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Lmb2bfJbK68cUh2gCj9GY8
+---
+ host/include/ps2host/utf8_path.h | 19 +++++++++++++++++++
+ host/src/gpu_bridge.cpp          |  5 +++--
+ host/src/mc2.cpp                 |  3 ++-
+ host/src/mcserv.cpp              |  7 ++++---
+ host/tests/host_tests.cpp        |  3 ++-
+ 5 files changed, 30 insertions(+), 7 deletions(-)
+ create mode 100644 host/include/ps2host/utf8_path.h
+
+diff --git a/host/include/ps2host/utf8_path.h b/host/include/ps2host/utf8_path.h
+new file mode 100644
+index 0000000..03edbf2
+--- /dev/null
++++ b/host/include/ps2host/utf8_path.h
+@@ -0,0 +1,19 @@
++/*
++ * A path's name as UTF-8 in a std::string, under C++17 and C++20 alike:
++ * path::u8string() is a std::string in C++17 and a std::u8string (char8_t)
++ * in C++20 - the default of GCC 16 (Fedora 44), where the host did not
++ * build (mc2.cpp, mcserv.cpp, gpu_bridge.cpp).
++ */
++#pragma once
++
++#include <filesystem>
++#include <string>
++
++namespace ps2host {
++
++inline std::string Utf8(const std::filesystem::path& path) {
++    const auto text = path.u8string();
++    return std::string(text.begin(), text.end());
++}
++
++}  // namespace ps2host
+diff --git a/host/src/gpu_bridge.cpp b/host/src/gpu_bridge.cpp
+index 6f4fb9a..feb08a6 100644
+--- a/host/src/gpu_bridge.cpp
++++ b/host/src/gpu_bridge.cpp
+@@ -68,6 +68,7 @@
+ #define XXH_INLINE_ALL
+ #include "xxhash.h"
+ 
++#include "ps2host/utf8_path.h"
+ #include "ps2host/gs.h"
+ #include "ps2host/gs_blend.h"
+ #include "ps2host/profile.h"
+@@ -3116,7 +3117,7 @@ void OpenTexturePack() {
+     std::string dir = std::getenv("PS2HOST_TEXTURE_PACK") ? std::getenv("PS2HOST_TEXTURE_PACK") : "";
+     if (dir.empty() && !SettingsPath().empty()) {
+         dir = Setting("texture_pack_dir");
+-        if (dir.empty()) dir = (fs::path(SettingsPath()).parent_path() / "texture pack").u8string();
++        if (dir.empty()) dir = Utf8(fs::path(SettingsPath()).parent_path() / "texture pack");
+     }
+     if (dir.empty()) return;
+     texture_pack::SetEnabled(SettingOn("texture_pack", true));
+@@ -3218,7 +3219,7 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
+     // run's settings are beside its memory card, in %TEMP% (what every
+     // game's runs there would share), and it makes every pipeline at once.
+     if (!SettingsPath().empty() && !VirtualClock())
+-        ps2gpu::SetPipelineCacheDir(std::filesystem::path(SettingsPath()).parent_path().u8string());
++        ps2gpu::SetPipelineCacheDir(Utf8(std::filesystem::path(SettingsPath()).parent_path()));
+     // Made on a thread of its own, the loading screen up meanwhile (a first
+     // start's, behind which the window answers): its first pipelines took
+     // half a minute on a cold driver, the window "not responding".
+diff --git a/host/src/mc2.cpp b/host/src/mc2.cpp
+index a5bf845..8fbc3d9 100644
+--- a/host/src/mc2.cpp
++++ b/host/src/mc2.cpp
+@@ -2,6 +2,7 @@
+  * libmc2's handlers over a directory (mc2.h).
+  */
+ 
++#include "ps2host/utf8_path.h"
+ #include "ps2host/platform.h"
+ #include "ps2host/mc2.h"
+ 
+@@ -124,7 +125,7 @@ struct Entry {
+ 
+ Entry Describe(const fs::path& path) {
+     Entry e;
+-    e.name = path.filename().u8string();
++    e.name = Utf8(path.filename());
+     e.path = path;
+     std::error_code error;
+     e.directory = fs::is_directory(path, error);
+diff --git a/host/src/mcserv.cpp b/host/src/mcserv.cpp
+index 4092f8d..afa770d 100644
+--- a/host/src/mcserv.cpp
++++ b/host/src/mcserv.cpp
+@@ -49,6 +49,7 @@
+ #include <system_error>
+ #include <vector>
+ 
++#include "ps2host/utf8_path.h"
+ #include "ps2host/platform.h"
+ #include "ps2host/host.h"
+ #include "ps2host/mc2.h"
+@@ -271,7 +272,7 @@ std::vector<u8> Server(u32 procedure, const std::vector<u8>& data) {
+             out.write(bytes.data(), std::streamsize(bytes.size()));
+             f->second.position += u32(bytes.size());
+             Note("mc write " + f->second.path.filename().string(),
+-                 "MC: wrote " + f->second.path.filename().u8string());
++                 "MC: wrote " + Utf8(f->second.path.filename()));
+             return Result(s32(bytes.size()));
+         }
+         case 0x0A: case 0x0E: case 0x10: case 0x14:
+@@ -310,13 +311,13 @@ std::vector<u8> Server(u32 procedure, const std::vector<u8>& data) {
+                     if (Matches(pattern.c_str(), "..")) card.listing.push_back(path / "..");
+                 }
+                 for (const auto& e : fs::directory_iterator(path, error))
+-                    if (Matches(pattern.c_str(), e.path().filename().u8string().c_str()))
++                    if (Matches(pattern.c_str(), Utf8(e.path().filename()).c_str()))
+                         card.listing.push_back(e.path());
+             }
+             s32 count = 0;
+             while (card.listed < card.listing.size() && count < most) {
+                 const fs::path& p = card.listing[card.listed++];
+-                const std::string entry_name = p.filename().u8string();
++                const std::string entry_name = Utf8(p.filename());
+                 PutEntry(table + 64 * u32(count), entry_name == "." || entry_name == ".." ? p.parent_path() : p,
+                          entry_name);
+                 ++count;
+diff --git a/host/tests/host_tests.cpp b/host/tests/host_tests.cpp
+index a0097dd..0bff0ef 100644
+--- a/host/tests/host_tests.cpp
++++ b/host/tests/host_tests.cpp
+@@ -43,6 +43,7 @@
+ #include "ps2gpu/vblank_fit.h"
+ #endif
+ #include "ps2host/refresh_lock.h"
++#include "ps2host/utf8_path.h"
+ 
+ /* vu_corpus.cpp (vurecomp.py --corpus, as the build goes): the random programs, compiled. */
+ const ps2host::VuCompiled* VuGeneratedPrograms(std::size_t* count);
+@@ -1079,7 +1080,7 @@ void MemoryCardKeepsSaves() {
+     const fs::path card = fs::temp_directory_path() / "ps2host_tests_memcard";
+     std::error_code error;
+     fs::remove_all(card, error);
+-    mc2::SetCardDirectory(card.u8string());
++    mc2::SetCardDirectory(ps2host::Utf8(card));
+     auto context = std::make_unique<lifted::Context>();
+     lifted::Context& c = *context;
+     constexpr u32 kName = 0x00100100, kBuffer = 0x00100200, kEntries = 0x00100400, kCount = 0x00100300;
+-- 
+2.56.1
+

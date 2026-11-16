@@ -1,0 +1,592 @@
+From 344a35e7f46c8fa8b715d7ad9d40d29ab86d7366 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 12:21:29 -0600
+Subject: [PATCH 1/2] High frame rates: even pacing on fixed screens, lost
+ blanks kept, a cheaper take-down; IOP log floods collapsed
+
+burnout3-pc #26 (stutter at 120, fine at 60):
+
+- FRAME RATE on a fixed-refresh screen (VRR off, its refresh known) is one
+  of the screen's whole fractions (refresh_lock::EvenRate): 120 on a 120 or
+  240 Hz screen, the screen's own on 144 or 165 Hz, where 120 pictures could
+  not be shown evenly (one in five shown twice). The blanks run at exactly
+  that rate, the screen's as reported, not SetFastForward(2)'s 119.88: that
+  against a 120.00 Hz screen gained a picture every 8.3 s (a stutter at a
+  steady beat) wherever the refresh lock was not in force. The step down
+  where the PC does not keep up goes to the screen's next fraction where
+  there is one (EvenRateBelow). Scripted runs (virtual time) and VRR
+  screens are unchanged.
+- Blanks the timer lost (LostVblanks: more than three waiting for a game
+  that is behind - 25 ms at 120) count as the picture's time in
+  HighFpsSteps / HighFpsFrameSteps (at most 8 a frame): before, each was a
+  step's time lost and the race went on in slow motion while the pictures
+  still came at 120. They also count with late pictures in KeepUp's step
+  down.
+- TakeDown / Measure / PlaceBetween: the transforms' tables are sorted
+  vectors walked side by side instead of hash maps (~850 allocations and
+  frees a step each, three maps). Checked with a synthetic game (300 moving
+  RwMatrix transforms, a camera, teleports; 2400 pictures at 120): the
+  placed RAM identical after every picture, old and new; the high frame
+  rate's own time a picture about 25% less (850 transforms in 2 MB).
+
+burnout3-pc #37 (the log grew to 500 MB): a module's line repeated is
+counted and said at 10, 100, 1000... times, and a failed sceCdRead is said
+(the first five) with where and why.
+
+Tests: refresh_lock's EvenRate / EvenRateBelow in host_tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Lmb2bfJbK68cUh2gCj9GY8
+---
+ host/include/ps2host/refresh_lock.h |  37 +++++
+ host/src/high_fps.cpp               | 230 +++++++++++++++++++++-------
+ host/src/iop_libs.cpp               |  42 ++++-
+ host/tests/host_tests.cpp           |  20 +++
+ 4 files changed, 272 insertions(+), 57 deletions(-)
+
+diff --git a/host/include/ps2host/refresh_lock.h b/host/include/ps2host/refresh_lock.h
+index 529bf3f..4c56242 100644
+--- a/host/include/ps2host/refresh_lock.h
++++ b/host/include/ps2host/refresh_lock.h
+@@ -41,6 +41,43 @@ inline int Refreshes(double blank_ns, double refresh_ns) {
+     return std::fabs(blank_ns - double(k) * refresh_ns) <= 0.005 * blank_ns ? int(k) : 0;
+ }
+ 
++/* A picture rate a fixed-refresh screen of `screen_hz` shows evenly - one of
++   its whole fractions (screen / k, k 1 to 4), every picture on screen for the
++   same number of refreshes - for one asked of `asked_hz`: the asked itself
++   when it is one (within 1%), else the nearest such fraction between
++   `least_hz` and `most_hz`, the lower of two as near; above the asked only
++   when within half again of it (a 144 Hz screen's 144 for 120: none below 90;
++   a 360 Hz screen's 120 is a fraction). 0: none, or the screen's not known.
++   120 a second free-running against a 144 Hz screen showed one picture in
++   five for two refreshes - 24 a second, a judder no pacing could undo. */
++inline double EvenRate(double asked_hz, double screen_hz, double least_hz, double most_hz) {
++    if (!(screen_hz > 0) || !(asked_hz > 0)) return 0.0;
++    double best = 0.0;
++    for (int k = 1; k <= 4; ++k) {
++        const double rate = screen_hz / k;
++        if (std::fabs(rate - asked_hz) <= 0.01 * asked_hz) return rate;
++        if (rate < least_hz - 1e-9 || rate > most_hz + 1e-9) continue;
++        if (rate > asked_hz * 1.5) continue;
++        if (best == 0.0 || std::fabs(rate - asked_hz) < std::fabs(best - asked_hz) - 1e-9 ||
++            (std::fabs(std::fabs(rate - asked_hz) - std::fabs(best - asked_hz)) <= 1e-9 && rate < best))
++            best = rate;
++    }
++    return best;
++}
++
++/* The highest of a fixed-refresh screen's whole fractions (screen / k, k 1
++   to 4) below `rate_hz` (by more than a hertz) and at `least_hz` or more: the
++   step down from a rate the machine did not keep up with that the screen
++   still shows evenly. 0: none (a 144 Hz screen below 144: 72 is under 90). */
++inline double EvenRateBelow(double rate_hz, double screen_hz, double least_hz) {
++    if (!(screen_hz > 0)) return 0.0;
++    for (int k = 1; k <= 4; ++k) {
++        const double rate = screen_hz / k;
++        if (rate < rate_hz - 1.0 && rate >= least_hz - 1e-9) return rate;
++    }
++    return 0.0;
++}
++
+ /* Where `since_anchor` (a time less a screen's blank) falls: after the
+    nearest of the screen's blanks by this much, -period/2 to period/2. */
+ inline double Phase(double since_anchor, double period) {
+diff --git a/host/src/high_fps.cpp b/host/src/high_fps.cpp
+index 1658c33..2dee809 100644
+--- a/host/src/high_fps.cpp
++++ b/host/src/high_fps.cpp
+@@ -36,6 +36,7 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++#include "ps2host/refresh_lock.h"
+ #include "ps2host/run.h"
+ #include "ps2host/settings.h"
+ #include "ps2rt/generated.h"
+@@ -66,12 +67,46 @@ unsigned g_frame_blanks = 1;            // the blanks the picture before took (t
+ // (HighFpsPicture, where the rate is chosen, runs only in its frames.)
+ std::atomic<int> g_blanks_since{0};
+ unsigned long long g_frames = 0;        // the game's frames (HighFpsFrameSteps)
++// The blanks the timer lost (LostVblanks: more came while three waited for
++// the game) since the frame before - real time the game's frame took all
++// the same, counted as its picture's (HighFpsSteps). Not counted, a game
++// behind at 120 (a blank 8.3 ms: three waiting are 25 ms, half of 60's 50)
++// lost a step's time for each: it went on in slow motion, the pictures
++// still coming at 120 (burnout3-pc #26: smooth at first, then "very laggy").
++u64 g_lost_seen = 0;
++unsigned g_lost_blanks = 0;
+ 
+ struct Matrix {
+     float m[16];
+ };
+-std::unordered_map<u32, Matrix> g_last, g_now;      // the transforms after the last two steps
++/* The transforms after a step, by address (ascending: the regions are read
++   in order) - vectors, not hash maps: ~850 a step, each step's taking down
++   was as many allocations and frees again (and the step's measure as many
++   more), now none once grown; the two steps' alike walked side by side. */
++struct Entry {
++    u32 address;
++    Matrix m;
++};
++using Table = std::vector<Entry>;
++Table g_last, g_now;                    // the transforms after the last two steps
+ std::vector<u32> g_known;           // where the last whole read found them (TakeDown)
++
++const Matrix* Find(const Table& table, u32 address) {
++    const auto at = std::lower_bound(table.begin(), table.end(), address,
++                                     [](const Entry& e, u32 a) { return e.address < a; });
++    return at != table.end() && at->address == address ? &at->m : nullptr;
++}
++
++/* Each transform of `now` found in `last` too, with it: f(address, last, now). */
++template <typename F>
++void Pairs(const Table& last, const Table& now, F&& f) {
++    auto l = last.begin();
++    for (const Entry& n : now) {
++        while (l != last.end() && l->address < n.address) ++l;
++        if (l == last.end()) return;
++        if (l->address == n.address) f(n.address, l->m, n.m);
++    }
++}
+ unsigned g_steps = 0;
+ // What the in-between placing covered: as the step left it, and as placed.
+ struct Placed {
+@@ -126,6 +161,15 @@ double RiseMs() {
+ }
+ int g_looks = 0;                        // looks since the rate changed
+ u64 g_late_seen = 0;                    // LatePictures at the last look
++u64 g_lost_looked = 0;                  // LostVblanks at the last look
++
++/* The screen's refresh where it is fixed (not VRR) and known, else 0: the
++   rates it shows evenly are its whole fractions (refresh_lock::EvenRate). */
++double FixedScreen() {
++    if (WindowVrr()) return 0.0;
++    const double screen = double(WindowRefreshRate());
++    return screen > 0.0 ? screen : 0.0;
++}
+ 
+ /* FRAME RATE, as pictures a second (60: none above the game's own):
+    PS2HOST_FRAME_RATE, else the setting - 120, or "display", the screen's
+@@ -151,6 +195,23 @@ double Wanted() {
+     const double screen = double(WindowRefreshRate());
+     if (screen > 0.0 && hz > screen * 1.02) hz = WindowVrr() ? std::floor(screen * 0.97) : screen;
+     double want = hz >= 1.5 * Own() ? std::min(hz, 240.0) : Own();
++    // On a fixed-refresh screen, a rate it shows evenly (EvenRate): 120 on a
++    // 144 or 165 Hz screen is the screen's own, 120 on 240 stays. Free-
++    // running against the screen, 120 under 144 showed one picture in five
++    // twice - a judder at a steady beat (burnout3-pc #26: "stutter at a fixed
++    // time interval" at 120, none at 60). Not in a scripted run (its rates
++    // are its own) nor on a VRR screen (its refresh follows the pictures).
++    if (want > Own() && !VirtualClock()) {
++        const double even = refresh_lock::EvenRate(want, FixedScreen(), 1.5 * Own(), 240.0);
++        static double said = 0.0;
++        if (even > 0.0 && std::fabs(even - want) > 0.01 * want) {
++            if (std::fabs(even - said) >= 0.5)
++                std::fprintf(stderr, "[high fps] %.0f a second is not even on a %.2f Hz screen: %.0f instead\n", want,
++                             FixedScreen(), even);
++            said = even;
++            want = even;
++        }
++    }
+     // PS2HOST_HIGH_FPS_FROM=<frame>: 60 until then (a scripted run's test:
+     // its presses land as at 60, and the same screen at 60 and above is
+     // compared at the same times).
+@@ -168,20 +229,28 @@ double Wanted() {
+ }
+ 
+ /* Each frame of the game's above 60: every two seconds or so, the pictures
+-   shown late since; more than 5% and the rate steps down (to the multiple
+-   of 60 below it). */
++   shown late since and the blanks the timer lost (the game itself behind:
++   its pictures may still be shown on time, each a step's time short); more
++   than 5% and the rate steps down - to the rate below it a fixed-refresh
++   screen shows evenly (240 to 120 on a 240 Hz screen), else to the multiple
++   of 60 below it. */
+ void KeepUp() {
+     const int sample = int(2.0 * g_rate);
+     if (++g_sampled < sample) return;
+     const u64 late_now = LatePictures(), late = late_now - g_late_seen;
++    const u64 lost_now = LostVblanks(), lost = lost_now - g_lost_looked;
+     g_late_seen = late_now;
++    g_lost_looked = lost_now;
+     g_sampled = 0;
+     if (g_looks++ == 0) return;         // (the change's own catching up)
+-    if (late * 20 > u64(sample)) {
+-        g_cap = std::max(Own(), 60.0 * std::ceil(g_rate / 60.0 - 1.0 - 1e-6));
++    if ((late + lost) * 20 > u64(sample)) {
++        const double even = refresh_lock::EvenRateBelow(g_rate, FixedScreen(), 1.5 * Own());
++        g_cap = even > 0.0 ? even : std::max(Own(), 60.0 * std::ceil(g_rate / 60.0 - 1.0 - 1e-6));
+         std::fprintf(stderr,
+-                     "[high fps] %llu of %d pictures late at %.0f a second: %.0f until the game's frames next stop\n",
+-                     static_cast<unsigned long long>(late), sample, g_rate, g_cap);
++                     "[high fps] %llu of %d pictures late, %llu blanks lost at %.0f a second: %.0f until the game's "
++                     "frames next stop\n",
++                     static_cast<unsigned long long>(late), sample, static_cast<unsigned long long>(lost), g_rate,
++                     g_cap);
+     }
+ }
+ 
+@@ -189,6 +258,23 @@ void KeepUp() {
+    120, 180, 240) as SetFastForward's multiple, exact; another (144, 165) at
+    its own rate. The steps a blank moves the game's time on. */
+ double Pace(double hz) {
++    // One of a fixed-refresh screen's whole fractions (120 on a 120 or 240 Hz
++    // screen): the blanks at exactly that, the screen's as it reports it,
++    // not twice the game's 59.94 - 119.88 against a 120.00 Hz screen gained
++    // a picture every 8.3 s (one shown twice: a stutter at a steady beat)
++    // wherever the lock to the screen's refresh (refresh_lock.h) was not in
++    // force (no measured refresh, VRR set on a fixed screen, given up). The
++    // game's steps stay its own (59.94 a second): each picture is that much
++    // less than half a step, the placing between steps takes it up. Not in
++    // a scripted run: its recorded pictures are at the exact multiples.
++    if (const double screen = FixedScreen(); screen > 0.0 && !VirtualClock())
++        for (int k = 1; k <= 4; ++k) {
++            const double rate = screen / k;
++            if (std::fabs(rate - hz) > 0.01 * hz) continue;
++            SetFastForward(1);
++            SetBlankRate(rate);
++            return g_game.steps_per_blank * kStepRate / rate;
++        }
+     const int multiple = std::max(int(hz / 60.0 + 0.5), 1);
+     if (std::fabs(hz - 60.0 * multiple) < multiple) {
+         SetBlankRate(0.0);
+@@ -294,21 +380,23 @@ float Determinant(const float* m) {
+ struct Stepped {
+     float moved = 0.0f, turn = 0.0f;
+ };
+-std::unordered_map<u32, Stepped> g_stepped, g_stepped_before;
++struct SteppedEntry {
++    u32 address;
++    Stepped stepped;
++};
++std::vector<SteppedEntry> g_stepped, g_stepped_before;      // by address, as the tables
+ 
+ void Measure() {
+     g_stepped_before.swap(g_stepped);
+     g_stepped.clear();
+-    for (const auto& [address, now] : g_now) {
+-        const auto last = g_last.find(address);
+-        if (last == g_last.end()) continue;
+-        const float* a = last->second.m;
++    Pairs(g_last, g_now, [](u32 address, const Matrix& last, const Matrix& now) {
++        const float* a = last.m;
+         const float* b = now.m;
+         const float d[3] = {b[12] - a[12], b[13] - a[13], b[14] - a[14]};
+         const float trace = Dot3(a, b) + Dot3(a + 4, b + 4) + Dot3(a + 8, b + 8);
+-        g_stepped[address] = {std::sqrt(Dot3(d, d)),
+-                              std::acos(std::min(1.0f, std::max(-1.0f, (trace - 1.0f) / 2.0f))) * 57.29578f};
+-    }
++        g_stepped.push_back({address, {std::sqrt(Dot3(d, d)),
++                                       std::acos(std::min(1.0f, std::max(-1.0f, (trace - 1.0f) / 2.0f))) * 57.29578f}});
++    });
+ }
+ 
+ /* A transform put somewhere else in a step, not moved there: over 2 units
+@@ -316,14 +404,24 @@ void Measure() {
+    but still - a wrecked car back on the road a few metres on (under the
+    game's cut), turned round. Blended, it slid there through the scene; it
+    is shown as the step left it. */
+-bool Teleported(u32 address) {
+-    const auto now = g_stepped.find(address);
+-    const auto before = g_stepped_before.find(address);
+-    if (now == g_stepped.end() || before == g_stepped_before.end()) return false;
+-    const Stepped& n = now->second;
+-    const Stepped& b = before->second;
+-    return (n.moved > 2.0f && n.moved > 4.0f * b.moved) || (n.turn > 60.0f && n.turn > 4.0f * b.turn + 10.0f);
+-}
++bool Teleported(const Stepped* n, const Stepped* b) {
++    if (!n || !b) return false;
++    return (n->moved > 2.0f && n->moved > 4.0f * b->moved) || (n->turn > 60.0f && n->turn > 4.0f * b->turn + 10.0f);
++}
++
++/* A cursor on a table of steps walked in address order (the transforms'):
++   each address's in turn, none where it has none. */
++class SteppedCursor {
++public:
++    explicit SteppedCursor(const std::vector<SteppedEntry>& table) : at_(table.begin()), end_(table.end()) {}
++    const Stepped* At(u32 address) {
++        while (at_ != end_ && at_->address < address) ++at_;
++        return at_ != end_ && at_->address == address ? &at_->stepped : nullptr;
++    }
++
++private:
++    std::vector<SteppedEntry>::const_iterator at_, end_;
++};
+ 
+ void LogBlends() {
+     std::FILE* f = BlendsFile();
+@@ -332,11 +430,12 @@ void LogBlends() {
+     static const auto start = std::chrono::steady_clock::now();
+     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+     std::unordered_map<u32, float> moved_now;
+-    for (const auto& [address, now] : g_now) {
+-        const auto last = g_last.find(address);
+-        if (last == g_last.end()) continue;
+-        const float* a = last->second.m;
+-        const float* b = now.m;
++    for (const Entry& entry : g_now) {
++        const u32 address = entry.address;
++        const Matrix* last = Find(g_last, address);
++        if (!last) continue;
++        const float* a = last->m;
++        const float* b = entry.m.m;
+         const float d[3] = {b[12] - a[12], b[13] - a[13], b[14] - a[14]};
+         const float moved = std::sqrt(Dot3(d, d));
+         const float trace = Dot3(a, b) + Dot3(a + 4, b + 4) + Dot3(a + 8, b + 8);
+@@ -378,10 +477,10 @@ void TakeDown() {
+     if (++g_steps % kRescan != 0 && !g_known.empty()) {
+         for (u32 address : g_known) {
+             const u8* p = generated::RamPointer(address, 64);
+-            Matrix m;
++            Entry e{address, {}};
+             if (!p) continue;
+-            std::memcpy(m.m, p, sizeof m.m);
+-            if (Shaped(m.m)) g_now.emplace(address, m);
++            std::memcpy(e.m.m, p, sizeof e.m.m);
++            if (Shaped(e.m.m)) g_now.push_back(e);
+         }
+         return;
+     }
+@@ -395,14 +494,21 @@ void TakeDown() {
+             float right[3];
+             std::memcpy(right, base + at, sizeof right);
+             if (!(std::fabs(Dot3(right, right) - 1.0f) < 0.01f)) continue;
+-            Matrix m;
+-            std::memcpy(m.m, base + at, sizeof m.m);
+-            if (!Shaped(m.m)) continue;
+-            g_now.emplace(region.begin + at, m);
+-            g_known.push_back(region.begin + at);
++            Entry e{region.begin + at, {}};
++            std::memcpy(e.m.m, base + at, sizeof e.m.m);
++            if (!Shaped(e.m.m)) continue;
++            g_now.push_back(e);
+             at += 48;                   // (its rows are not another's)
+         }
+     }
++    // By address, once each (a game's regions given out of order, or
++    // overlapping): what the walks side by side and the lookups need.
++    const auto before = [](const Entry& a, const Entry& b) { return a.address < b.address; };
++    if (!std::is_sorted(g_now.begin(), g_now.end(), before)) std::stable_sort(g_now.begin(), g_now.end(), before);
++    g_now.erase(std::unique(g_now.begin(), g_now.end(),
++                            [](const Entry& a, const Entry& b) { return a.address == b.address; }),
++                g_now.end());
++    for (const Entry& e : g_now) g_known.push_back(e.address);
+ }
+ 
+ void Normalise(float* v) {
+@@ -440,14 +546,15 @@ Matrix Between(const Matrix& a, const Matrix& b, float t) {
+ }
+ 
+ /* A transform that moved, placed `t` of the way from the step before to
+-   the last. */
+-void Place(u32 address, const Matrix& last, const Matrix& now, float t) {
++   the last (`stepped`, `before`: its last two steps, Teleported's). */
++void Place(u32 address, const Matrix& last, const Matrix& now, float t, const Stepped* stepped,
++           const Stepped* before) {
+     float d[3];
+     for (int k = 0; k < 3; ++k) d[k] = now.m[12 + k] - last.m[12 + k];
+     const float moved = std::sqrt(Dot3(d, d));
+     bool turned = false;
+     for (int k = 0; k < 12 && !turned; ++k) turned = now.m[k] != last.m[k];
+-    if ((moved == 0.0f && !turned) || moved > g_game.cut || Teleported(address)) return;
++    if ((moved == 0.0f && !turned) || moved > g_game.cut || Teleported(stepped, before)) return;
+     u8* p = generated::RamPointer(address, 64);
+     if (!p) return;
+     Placed placed{address, {}, {}};
+@@ -511,10 +618,12 @@ void PlaceBetween(float t) {
+     // for the step's pictures, then caught up (a twitch at every cut).
+     for (const CameraValues& v : g_cameras)
+         if (v.cut) return;
+-    for (const auto& [address, now] : g_now) {
+-        const auto last = g_last.find(address);
+-        if (last != g_last.end()) Place(address, last->second, now, t);
+-    }
++    // (the steps' tables walked alongside: by address, as the transforms)
++    SteppedCursor stepped(g_stepped), before(g_stepped_before);
++    Pairs(g_last, g_now, [&](u32 address, const Matrix& last, const Matrix& now) {
++        const Stepped* n = stepped.At(address);
++        Place(address, last, now, t, n, n ? before.At(address) : nullptr);
++    });
+ }
+ 
+ /* What the placing covered, back as the step left it - where the picture
+@@ -576,26 +685,26 @@ void TraceSubjects(std::FILE* f) {
+             const float d[3] = {m.m[12] - at[0], m.m[13] - at[1], m.m[14] - at[2]};
+             return std::sqrt(Dot3(d, d));
+         };
+-        const auto kept = g_now.find(chosen[k]);
+-        if (kept == g_now.end() || distance(kept->second) > 3.0f) {
++        const Matrix* kept = Find(g_now, chosen[k]);
++        if (!kept || distance(*kept) > 3.0f) {
+             float best = 1e30f;
+             chosen[k] = 0;
+-            for (const auto& [address, m] : g_now) {
+-                const float d = distance(m);
++            for (const Entry& e : g_now) {
++                const float d = distance(e.m);
+                 if (d < best) {
+                     best = d;
+-                    chosen[k] = address;
++                    chosen[k] = e.address;
+                 }
+             }
+         }
+-        const auto now = g_now.find(chosen[k]);
+-        const auto last = g_last.find(chosen[k]);
+-        if (now == g_now.end()) {
++        const Matrix* now = Find(g_now, chosen[k]);
++        const Matrix* last = Find(g_last, chosen[k]);
++        if (!now) {
+             std::fprintf(f, ",0,0,0,0,0,0,0,0,0,0,0,0");
+             continue;
+         }
+-        const Matrix& b = now->second;
+-        const Matrix& a = last != g_last.end() ? last->second : b;
++        const Matrix& b = *now;
++        const Matrix& a = last ? *last : b;
+         const float* placed = b.m + 12;
+         bool was_placed = false;
+         for (const Placed& p : g_placed)
+@@ -675,6 +784,8 @@ void Reset() {
+     g_time = 1.0;
+     g_behind = 0.0;
+     g_counted = false;
++    g_lost_seen = LostVblanks();        // (what was lost before is not this rate's)
++    g_lost_blanks = 0;
+ }
+ 
+ }  // namespace
+@@ -703,8 +814,11 @@ bool HighFpsFrameSteps(u32 steps_so_far, unsigned blanks) {
+     g_frame_blanks = blanks;
+     g_step_count = steps_so_far;
+     g_counted = true;
++    // (the blanks lost that HighFpsSteps counted for this frame: its time)
++    const unsigned lost = g_lost_blanks;
++    g_lost_blanks = 0;
+     if (g_rate > 0.0) {
+-        g_behind += double(g_frame_steps) - g_per_picture * std::max(1u, blanks);
++        g_behind += double(g_frame_steps) - g_per_picture * (std::max(1u, blanks) + lost);
+         if (g_behind >= 1.0) g_behind -= std::floor(g_behind);
+         if (g_behind < 0.0) g_behind = 0.0;
+         g_picture_time = float(1.0 - g_behind);
+@@ -799,7 +913,13 @@ void HighFpsPicture() {
+ 
+ int HighFpsSteps(unsigned blanks, int most) {
+     if (g_rate <= 0.0) return -1;
+-    g_time += g_per_picture * std::max(1u, blanks);
++    // The blanks the timer lost since (the game behind): its time all the
++    // same, as at 60 a picture late is caught up - a few at most (a stall of
++    // seconds is not run through; `most` bounds the steps in any case).
++    const u64 lost_now = LostVblanks();
++    g_lost_blanks = unsigned(std::min<u64>(lost_now - g_lost_seen, 8));
++    g_lost_seen = lost_now;
++    g_time += g_per_picture * (std::max(1u, blanks) + g_lost_blanks);
+     int steps = 0;
+     while (g_time > 1.0 + 1e-6) {
+         g_time -= 1.0;
+diff --git a/host/src/iop_libs.cpp b/host/src/iop_libs.cpp
+index f075d93..3a17da4 100644
+--- a/host/src/iop_libs.cpp
++++ b/host/src/iop_libs.cpp
+@@ -29,6 +29,7 @@
+ #include <cctype>
+ #include <map>
+ #include <memory>
++#include <mutex>
+ #include <sstream>
+ 
+ #include "iop_vm_internal.h"
+@@ -61,10 +62,35 @@ Outcome Ret(Context& c, u32 value) {
+ u64 UsToClock(u64 us) { return us * kClockHz / 1000000; }
+ u64 ClockToUs(u64 clock) { return clock * 1000000 / kClockHz; }
+ 
++/* A module's own line (Kprintf, printf), to the log - the same line again
++   and again (a module retrying for ever: burnout3-pc #37's "Error reading
++   TOC" took the log to 500 MB) counted, said at 10, 100, 1000... times and
++   when another line comes. */
+ void Log(const std::string& text) {
+     std::string line = text;
+     while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+-    if (!line.empty()) std::fprintf(stderr, "[iop] %s\n", line.c_str());
++    if (line.empty()) return;
++    static std::mutex lock;
++    static std::string last;
++    static u64 again = 0, said = 0;           // the last line's repeats, and at the last saying
++    std::lock_guard<std::mutex> hold(lock);
++    if (line == last) {
++        ++again;
++        u64 mark = 10;
++        while (mark < again) mark *= 10;
++        if (again == mark) {
++            std::fprintf(stderr, "[iop] (the line above, again %llu times so far)\n",
++                         static_cast<unsigned long long>(again));
++            said = again;
++        }
++        return;
++    }
++    if (again > said)
++        std::fprintf(stderr, "[iop] (the line above, again %llu time%s in all)\n", static_cast<unsigned long long>(again),
++                     again == 1 ? "" : "s");
++    last = line;
++    again = said = 0;
++    std::fprintf(stderr, "[iop] %s\n", line.c_str());
+ }
+ 
+ // ---------------------------------------------------------------- threads
+@@ -981,8 +1007,20 @@ Outcome CdRead(Vm& vm, Context& c) {
+     const u32 lsn = A(vm, c, 0), sectors = A(vm, c, 1), buffer = A(vm, c, 2), mode = A(vm, c, 3);
+     const u32 pattern = mode ? *vm.At(mode + 2, 1) : 0;
+     std::vector<u8> data(std::size_t(sectors) * Disc::PatternSize(pattern));
+-    if (!GuestDisc().IsOpen() || !GuestDisc().ReadPattern(lsn, sectors, pattern, data.data()))
++    if (!GuestDisc().IsOpen() || !GuestDisc().ReadPattern(lsn, sectors, pattern, data.data())) {
++        // Said the first few times: a module's read the disc image could not
++        // give (past its end - a cut-short or different image - or none
++        // open), which the module may retry for ever (burnout3-pc #37's loading screen).
++        static int told = 0;
++        if (told < 5) {
++            ++told;
++            std::fprintf(stderr,
++                         "[iop] sceCdRead of %u sectors at %u (pattern %u) failed: %s - is the disc image whole and "
++                         "the right one?\n",
++                         sectors, lsn, pattern, GuestDisc().IsOpen() ? "not in the disc image" : "no disc image open");
++        }
+         return Ret(c, 0);
++    }
+     std::memcpy(vm.At(buffer, u32(data.size())), data.data(), data.size());
+     return Ret(c, 1);
+ }
+diff --git a/host/tests/host_tests.cpp b/host/tests/host_tests.cpp
+index 9a21b6c..a0097dd 100644
+--- a/host/tests/host_tests.cpp
++++ b/host/tests/host_tests.cpp
+@@ -2059,6 +2059,26 @@ void BlanksLockToTheScreen() {
+               lock.state() == rl::Lock::State::kOff,
+           "refresh lock: off when the screen is not known");
+ 
++    // The rates a fixed screen shows evenly (high_fps.cpp's FRAME RATE): 120
++    // where it divides the screen's, the screen's own where it does not and
++    // is near (144, 165), the nearer fraction where one is (180: 90), none
++    // where the screen is not known; and the step down.
++    auto near = [](double a, double b) { return std::fabs(a - b) < 1e-6; };
++    Check(near(rl::EvenRate(120, 120, 90, 240), 120) && near(rl::EvenRate(120, 240, 90, 240), 120) &&
++              near(rl::EvenRate(120, 119.88, 90, 240), 119.88) && near(rl::EvenRate(120, 360, 90, 240), 120),
++          "even rate: 120 kept where the screen's divides into it");
++    Check(near(rl::EvenRate(120, 144, 90, 240), 144) && near(rl::EvenRate(120, 165, 90, 240), 165) &&
++              near(rl::EvenRate(144, 143.86, 90, 240), 143.86),
++          "even rate: the screen's own where 120 does not divide it");
++    Check(near(rl::EvenRate(120, 180, 90, 240), 90) && near(rl::EvenRate(120, 200, 90, 240), 100) &&
++              rl::EvenRate(120, 0, 90, 240) == 0.0 && rl::EvenRate(120, 300, 90, 240) == 100.0,
++          "even rate: the nearest fraction, none where the screen is not known");
++    Check(near(rl::EvenRate(100, 280, 90, 240), 280.0 / 3) && rl::EvenRate(240, 250, 90, 240) == 125.0,
++          "even rate: never above the most");
++    Check(near(rl::EvenRateBelow(240, 240, 90), 120) && rl::EvenRateBelow(144, 144, 90) == 0.0 &&
++              near(rl::EvenRateBelow(120, 240, 90), 0.0) && near(rl::EvenRateBelow(180, 180, 90), 90),
++          "even rate: the step down to the next fraction, none below the least");
++
+     // A lead: each blank 3 ms before one of the screen's (a picture done
+     // 2 ms after its blank, shown at once), then 9 ms at 144 (as the
+     // refreshes go: 2.06 ms) - taken up at the slew's pace, locked all along.
+-- 
+2.56.1
+
