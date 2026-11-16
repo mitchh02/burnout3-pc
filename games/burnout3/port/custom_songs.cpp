@@ -43,6 +43,7 @@
 #include <string>
 #include <vector>
 
+#include "ps2host/utf8_path.h"
 #include "ps2host/custom_songs.h"
 #include "ps2host/host.h"
 #include "ps2host/music.h"
@@ -164,7 +165,7 @@ void SaveChoices() {
     std::ofstream out(ChoicesFile(), std::ios::trunc);
     if (!out) return;
     out << "# The EA TRAX menu's choice for each custom song (15 ALL, 1 RACE ONLY, 4 MENU ONLY, 0 OFF)\n";
-    for (const auto& [name, choice] : st.choices) out << choice << ' ' << fs::path(name).u8string() << '\n';
+    for (const auto& [name, choice] : st.choices) out << choice << ' ' << ps2host::Utf8(fs::path(name)) << '\n';
 }
 
 u32 ChoiceOf(const Song& s) {
@@ -227,7 +228,7 @@ void Build(const std::vector<Song>& songs) {
     st.songs = songs;
     if (!st.installed)
         std::fprintf(stderr, "[custom songs] %zu custom song%s in EA Trax (%s)\n", songs.size(),
-                     songs.size() == 1 ? "" : "s", Folder().u8string().c_str());
+                     songs.size() == 1 ? "" : "s", ps2host::Utf8(Folder()).c_str());
     st.installed = true;
 }
 
@@ -459,9 +460,9 @@ void StreamOpen(lifted::Context& c) {
     State& st = St();
     const u32 from_ms = u32(c.r[7]);
     const Song& song = st.songs[st.fake_song - kGameSongs];
-    if (ps2host::MusicPlay(song.file.u8string(), from_ms / 1000.0, true)) {
+    if (ps2host::MusicPlay(ps2host::Utf8(song.file), from_ms / 1000.0, true)) {
         std::fprintf(stderr, "[custom songs] song %u: %s (from %.1f s)\n", unsigned(st.fake_song + 1),
-                     song.file.filename().u8string().c_str(), from_ms / 1000.0);
+                     ps2host::Utf8(song.file.filename()).c_str(), from_ms / 1000.0);
         SetStreamState(kStreamOpen);
     } else {
         SetStreamState(kStreamEnded);           // unreadable: over at once (the next song)
